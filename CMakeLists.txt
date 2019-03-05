@@ -1,0 +1,5 @@
+cmake_minimum_required (VERSION 2.6)
+project (Cppconnect)
+add_executable(Cppconnect cppnc.cpp)
+add_library(CppSocket socket.cpp)
+target_link_libraries(Cppconnect CppSocket)
