@@ -190,8 +190,10 @@ int Connections<T>::process(int timeout)
 
           for (i = 0; i < n_recv; i++)
             {
+              /*
               std::cout << "Event " << std::to_string(ev[i].events) << " from "
                         << std::to_string(ev[i].data.fd) << std::endl;
+                        */
 
               // Throws on bad fd.
               auto &conn = connections.at(ev[i].data.fd);
@@ -203,6 +205,10 @@ int Connections<T>::process(int timeout)
                     {
                       connections.erase(ev[i].data.fd);
                     }
+                  else if (conn.finished)
+                    {
+                      ccb(ctx, conn.fd);
+                    }
                 }
               else if (conn.finished && !conn.read(data))
                 {
@@ -210,7 +216,7 @@ int Connections<T>::process(int timeout)
                 }
               else
                 {
-                  // rcb(data);
+                  rcb(ctx, data);
                 }
             }
         }
@@ -247,7 +253,7 @@ int Connections<T>::connect_to_endpoint(struct addrinfo *dst,
               ret = fd;
               if (inserted.first->second.finished)
                 {
-                  // ccb(fd);
+                  ccb(ctx, fd);
                 }
             }
           else
@@ -293,8 +299,8 @@ void Connections<T>::send_yall(const std::string &data)
 }
 
 template <typename T>
-Connections<T>::Connections(connected_cb ccb, read_cb rcb) throw()
-  : efd(-1), ccb(ccb), rcb(rcb)
+Connections<T>::Connections(T *ctx, connected_cb ccb, read_cb rcb) throw()
+  : efd(-1), ccb(ccb), rcb(rcb), ctx(ctx)
 {
   std::exception e;
 

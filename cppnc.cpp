@@ -20,7 +20,7 @@ class NetCat
  public:
   NetCat(std::string &dst, std::string &port, std::string &src,
          int type = SOCK_STREAM)
-    : conns(std::mem_fn(&NetCat::connected), std::mem_fn(&NetCat::read_cb))
+    : conns(this, std::mem_fn(&NetCat::connected), std::mem_fn(&NetCat::read_cb))
   {
     struct epoll_event ev = { };
     std::system_error e;

@@ -3,6 +3,7 @@
 #include <functional>
 #include <map>
 #include <iostream>
+#include <memory>
 
 extern "C"
 {
@@ -61,12 +62,17 @@ class Connections
 
   // std::unique_ptr<SocketConnection> add_listener(struct addrinfo *src);
   using connected_cb = std::_Mem_fn<void(T::*)(int)>;
+  //using connected_cb = std::function<void(T, int)>;
   //using read_cb = std::function<T(const std::stringstream &data)>;
   using read_cb = std::_Mem_fn<void (T::*)(const std::stringstream &data)>;
 
-  Connections(connected_cb ccb, read_cb rcb) throw();
+  explicit Connections();
+  Connections(T *ctx, connected_cb ccb, read_cb rcb) throw();
 
   ~Connections();
+
+  Connections(const Connections&) = delete;
+  Connections& operator=(const Connections&) = delete;
 
  private:
   std::map<int, SocketConnection> connections;
@@ -74,6 +80,7 @@ class Connections
   int efd;
   connected_cb ccb;
   read_cb rcb;
+  T *ctx;
 };
 
 #include "socket_internal.hpp"
