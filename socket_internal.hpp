@@ -190,12 +190,6 @@ int Connections<T>::process(int timeout)
 
           for (i = 0; i < n_recv; i++)
             {
-              /*
-              std::cout << "Event " << std::to_string(ev[i].events) << " from "
-                        << std::to_string(ev[i].data.fd) << std::endl;
-                        */
-
-              // Throws on bad fd.
               auto &conn = connections.at(ev[i].data.fd);
               std::stringstream data;
 
@@ -207,6 +201,15 @@ int Connections<T>::process(int timeout)
                     }
                   else if (conn.finished)
                     {
+                      struct epoll_event ev = {};
+
+                      ev.data.fd = conn.fd;
+                      ev.events = EPOLLIN;
+
+                      if (epoll_ctl(efd, EPOLL_CTL_MOD, conn.fd, &ev))
+                        {
+                          abort();
+                        }
                       ccb(ctx, conn.fd);
                     }
                 }
@@ -216,7 +219,7 @@ int Connections<T>::process(int timeout)
                 }
               else
                 {
-                  rcb(ctx, data);
+                  rcb(ctx, conn.fd, data);
                 }
             }
         }
@@ -247,6 +250,11 @@ int Connections<T>::connect_to_endpoint(struct addrinfo *dst,
 
           ev.data.fd = fd;
           ev.events = EPOLLIN;
+
+          if (!inserted.first->second.finished)
+            {
+              ev.events |= EPOLLOUT;
+            }
 
           if (!epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev))
             {
