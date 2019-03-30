@@ -39,12 +39,26 @@ TEST_F(SukatSocketTest, SukatSocketTestInit)
   EXPECT_GT(ret, 0);
   EXPECT_NE(nullptr, conn_from_server);
 
+  while (!client.ready())
+    {
+      bool bret = client.finish();
+      EXPECT_EQ(true, bret);
+    }
+
   data = "hello from server";
   ret = conn_from_server->writeData(
     reinterpret_cast<const uint8_t *>(data.c_str()), data.length());
   EXPECT_EQ(ret, data.length());
 
   auto readData = client.readData();
+  EXPECT_EQ(data, readData.str());
+
+  data = "Hello from client";
+  ret = client.writeData(reinterpret_cast<const uint8_t *>(data.c_str()),
+                         data.length());
+  EXPECT_EQ(ret, data.length());
+
+  readData = conn_from_server->readData();
   EXPECT_EQ(data, readData.str());
 }
 

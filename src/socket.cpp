@@ -97,7 +97,7 @@ Socket::~Socket()
 {
   int retry = 5;
 
-  Logger::Dbg("Closing socket", this);
+  Logger::Dbg("Closing socket ", this);
   while (::close(mFd) == -1 && --retry)
     {
       // Generate a core for bad fd investigating.
@@ -126,6 +126,7 @@ SocketConnection::SocketConnection(int socktype,
   memcpy(&mDestination, &dst, sizeof(mDestination));
   if (!connect(fd(), reinterpret_cast<const struct sockaddr *>(&dst), slen))
     {
+      Logger::Dbg("Connected socket ", this);
       complete = true;
     }
   else if (errno != EINPROGRESS)
@@ -134,6 +135,7 @@ SocketConnection::SocketConnection(int socktype,
     }
   else
     {
+      Logger::Dbg("Connection in progress in socket ", this);
       // TCP handshake in progress.
     }
 }
@@ -146,6 +148,7 @@ std::stringstream SocketConnection::readData() const
 
   while ((ret = ::recv(fd(), buf, sizeof(buf), 0)) > 0)
     {
+      Logger::Dbg("Read ", ret, " bytes from ", this);
       data.write(buf, ret);
     }
   if (!(ret == -1 &&
@@ -180,7 +183,8 @@ bool SocketConnection::finish()
             mDestinationLen);
   if (!ret || (ret == -1 && errno == EINPROGRESS))
     {
-      Logger::Dbg("Connection ", this, (complete) ? "in progress" : "finished");
+      Logger::Dbg("Connection ", this,
+                  (complete) ? "in progress" : " finished");
       complete = (ret != -1);
     }
   else
