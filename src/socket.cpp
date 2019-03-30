@@ -33,19 +33,14 @@ const Socket::sockopts Socket::defaultSockopts =
 
 Socket::Socket(int socktype, Socket::sockopts sockopts,
                const struct sockaddr_storage *src, socklen_t src_len)
-  :  mSourceLen(src_len)
+     : mSourceLen(sizeof(mSource))
 {
   std::system_error e;
-  memset(&mSource, 0, sizeof(mSource));
-  if (mSourceLen)
-    {
-      memcpy(&mSource, src, mSourceLen);
-    }
 
-  LOG_DBG("Creating socket family: ", mSource.ss_family, ", type: ",
-              socktype, ", socklen: ", mSourceLen);
+  LOG_DBG("Creating socket family: ", src->ss_family, ", type: ",
+              socktype, ", socklen: ", src_len);
 
-  mFd = ::socket(mSource.ss_family, socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  mFd = ::socket(src->ss_family, socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (mFd != -1)
     {
       for (const auto &opt : sockopts)
@@ -57,21 +52,20 @@ Socket::Socket(int socktype, Socket::sockopts sockopts,
             }
         }
 
-      if (!bind(mFd, reinterpret_cast<struct sockaddr *>(&mSource), mSourceLen))
+      if (!bind(mFd, reinterpret_cast<const struct sockaddr *>(src), src_len))
         {
-          if (src != &inAnyAddr ||
-              ((mSourceLen = sizeof(mSource)) &&
-               getsockname(mFd, reinterpret_cast<struct sockaddr *>(&mSource),
-                           &mSourceLen)))
+          // Extra if already known.
+          if (!getsockname(mFd, reinterpret_cast<struct sockaddr *>(&mSource),
+                           &mSourceLen))
 
-            {
-              e =
-                std::system_error(errno, std::system_category(), "getsockname");
-            }
-          else
             {
               LOG_DBG("Created socket: ", this);
               return;
+            }
+          else
+            {
+              e =
+                std::system_error(errno, std::system_category(), "getsockname");
             }
         }
       else
@@ -124,6 +118,7 @@ SocketConnection::SocketConnection(int socktype,
   : Socket(socktype), mDestinationLen(slen), complete(false)
 {
   memcpy(&mDestination, &dst, sizeof(mDestination));
+  LOG_DBG("Connecting to ", saddr_to_string(&mDestination, mDestinationLen));
   if (!connect(fd(), reinterpret_cast<const struct sockaddr *>(&dst), slen))
     {
       LOG_DBG("Connected socket ", this);
@@ -161,6 +156,7 @@ std::stringstream SocketConnection::readData() const
 
 int SocketConnection::writeData(const uint8_t *data, size_t len) const
 {
+  LOG_DBG("Sending ", len, " bytes to ", this);
   return ::send(fd(), data, len, 0);
 }
 
@@ -173,6 +169,30 @@ SocketConnection::SocketConnection(int fd, const SocketListener &main,
   if (dst && dst_len)
     {
       ::memcpy(&mDestination, dst, dst_len);
+    }
+}
+
+SocketConnection::SocketConnection(int socktype, sockopts opts,
+                                   const struct sockaddr_storage &src,
+                                   socklen_t slen,
+                                   const struct sockaddr_storage &dst,
+                                   socklen_t dlen)
+  : Socket(socktype, opts, &src, slen), mDestinationLen(dlen), complete(false)
+{
+  memcpy(&mDestination, &dst, sizeof(mDestination));
+  if (!connect(fd(), reinterpret_cast<const struct sockaddr *>(&dst), slen))
+    {
+      LOG_DBG("Connected socket ", this);
+      complete = true;
+    }
+  else if (errno != EINPROGRESS)
+    {
+      throw std::system_error(errno, std::system_category(), "Connect");
+    }
+  else
+    {
+      LOG_DBG("Connection in progress in socket ", this);
+      // TCP handshake in progress.
     }
 }
 
@@ -194,19 +214,20 @@ bool SocketConnection::finish()
   return true;
 }
 
-unsigned int SocketListener::acceptNew(
-  std::function<void(std::unique_ptr<SocketConnection> &&)> new_fn) const
+unsigned int SocketListener::acceptNew(newClientCb cb,
+                                       accessCb cb_access) const
 {
-  int ret;
+  std::unique_ptr<SocketConnection> ret(nullptr);
   unsigned int count = 0;
   struct sockaddr_storage addr;
   socklen_t len = sizeof(addr);
+  std::vector<uint8_t> data(BUFSIZ);
 
-  while ((ret = getNewClient(&addr, &len)) != -1)
+  while ((ret = getNewClient(&addr, &len, data, cb_access)) != nullptr)
     {
-      LOG_DBG("New fd: ", ret,
+      LOG_DBG("New fd: ", ret->fd(),
               ", connected from: ", saddr_to_string(&addr, len));
-      new_fn(std::make_unique<SocketConnection>(ret, *this, len, &addr));
+      cb(std::move(ret), data);
       len = sizeof(addr);
       count++;
     }
@@ -220,7 +241,7 @@ SocketListenerTcp::SocketListenerTcp(const struct sockaddr_storage *saddr,
 {
   if (!listen(fd(), 16))
     {
-      LOG_DBG("Listening on: ", this);
+      LOG_DBG("Listening TCP on: ", this);
       // Success.
     }
   else
@@ -229,15 +250,27 @@ SocketListenerTcp::SocketListenerTcp(const struct sockaddr_storage *saddr,
     }
 }
 
-int SocketListenerTcp::getNewClient(struct sockaddr_storage *dst,
-                                    socklen_t *slen) const
+std::unique_ptr<SocketConnection> SocketListenerTcp::getNewClient(
+  struct sockaddr_storage *dst, socklen_t *slen,
+  __attribute__((unused)) std::vector<uint8_t> &data, accessCb cb_access) const
 {
   int new_fd = ::accept4(fd(), reinterpret_cast<struct sockaddr *>(dst), slen,
                          SOCK_NONBLOCK | SOCK_CLOEXEC);
 
   if (new_fd != -1)
     {
-      return new_fd;
+      std::vector<uint8_t> empty_handshake(0);
+
+      if (!cb_access || cb_access(dst, *slen, empty_handshake) ==
+                          SocketListener::accessReturn::ACCESS_NEW)
+        {
+          return std::make_unique<SocketConnection>(new_fd, *this, *slen, dst);
+        }
+      else
+        {
+          LOG_DBG("New client ", saddr_to_string(dst, *slen), " denied");
+          close(new_fd);
+        }
     }
   else
     {
@@ -246,5 +279,69 @@ int SocketListenerTcp::getNewClient(struct sockaddr_storage *dst,
           throw std::system_error(errno, std::system_category(), "Accept");
         }
     }
-  return -1;
+  return nullptr;
+}
+
+SocketListenerUdp::SocketListenerUdp(const struct sockaddr_storage *saddr,
+                                     socklen_t slen)
+  : SocketListener::SocketListener(
+      SOCK_DGRAM,
+      std::set{std::make_pair<int, int>(SO_REUSEADDR, 1),
+               std::make_pair<int, int>(SO_REUSEPORT, 1)},
+      saddr, slen)
+{
+  LOG_DBG("Listening UDP on: ", this);
+}
+
+std::unique_ptr<SocketConnection> SocketListenerUdp::getNewClient(
+  struct sockaddr_storage *dst, socklen_t *slen, std::vector<uint8_t> &data,
+  accessCb cb_access) const
+{
+  int ret;
+  struct iovec iov =
+    {
+      .iov_base = data.data(),
+      .iov_len = data.capacity()
+    };
+  struct msghdr hdr =
+    {
+      .msg_name = dst,
+      .msg_namelen = *slen,
+      .msg_iov = &iov,
+      .msg_iovlen = 1,
+      .msg_control = nullptr,
+      .msg_controllen = 0,
+      .msg_flags = 0
+    };
+
+  ret = ::recvmsg(fd(), &hdr, 0);
+  if (ret >= 0)
+    {
+      SocketListener::accessReturn access_ret =
+        SocketListener::accessReturn::ACCESS_NEW;
+
+      data.resize(ret);
+      if (cb_access)
+        {
+          access_ret = cb_access(dst, hdr.msg_namelen, data);
+        }
+      if (access_ret == SocketListener::accessReturn::ACCESS_NEW)
+        {
+          return std::make_unique<SocketConnection>(
+            SOCK_DGRAM, defaultSockopts, this->mSource, this->mSourceLen, *dst,
+            hdr.msg_namelen);
+        }
+      else
+        {
+          LOG_DBG("Peer ", saddr_to_string(dst, *slen), " ",
+                  (access_ret == SocketListener::accessReturn::ACCESS_DENY)
+                    ? "denied"
+                    : "existed");
+        }
+    }
+  else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+    {
+      LOG_ERR("Failed to read ", this, ": ", strerror(errno));
+    }
+  return nullptr;
 }

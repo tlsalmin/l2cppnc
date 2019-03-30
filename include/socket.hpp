@@ -84,6 +84,8 @@ class Socket
   socklen_t mSourceLen;            //!< Length of source bound to.
   struct sockaddr_storage mSource; //!< Storage of bound data.
 
+  Socket(Socket&& other) = delete;
+
  protected:
   static const socklen_t inAnyAddrLen;   //!< Default socket address length.
   static const sockopts defaultSockopts; //!< Default options for socket.
@@ -124,6 +126,11 @@ class SocketConnection : public Socket
   SocketConnection(int socktype, const struct sockaddr_storage &dst,
                    socklen_t slen);
 
+  /** @brief Same but bind to the given source and connect */
+  SocketConnection(int socktype, sockopts opts,
+                   const struct sockaddr_storage &src, socklen_t slen,
+                   const struct sockaddr_storage &dst, socklen_t dlen);
+
  private:
   socklen_t mDestinationLen;            //!< Socket destination.
   struct sockaddr_storage mDestination; //!< Destination length.
@@ -134,14 +141,47 @@ class SocketConnection : public Socket
 class SocketListener : public Socket
 {
  public:
-   /** @brief Accept any new pending connections */
-  unsigned int acceptNew(
-    std::function<void(std::unique_ptr<SocketConnection> &&)> new_fn) const;
+   /** @brief Return values for accessCb determining what to do with data */
+  enum class accessReturn
+  {
+    ACCESS_NEW,    //!< Create a new connection.
+    ACCESS_EXISTS, //!< Peer already exists.
+    ACCESS_DENY    //!< Deny peer.
+  };
+  /**
+   * @brief Callback per new client.
+   *
+   * @param new_conn   Unique pointer to the new connection.
+   * @param data       Possible handshake data received while accepting client.
+   */
+  using newClientCb = std::function<void(
+    std::unique_ptr<SocketConnection> &&new_conn, std::vector<uint8_t> &data)>;
+
+  using accessCb = std::function<accessReturn(
+    const struct sockaddr_storage *peer,
+    socklen_t peer_len, std::vector<uint8_t> &data)>;
+  /**
+   * @brief Accept any new pending connections
+   *
+   * @param cb         Callback per connection.
+   *
+   * @return Number of accepted connections.
+   */
+  unsigned int acceptNew(newClientCb cbj, accessCb cb_access = nullptr) const;
 
  protected:
-  /** @brief Fetch a new connection from derived class */
-  virtual int getNewClient(struct sockaddr_storage *dst,
-                           socklen_t *slen) const = 0;
+  /**
+   * @brief Fetch a new connection from derived class
+   *
+   * @param dst         Storage for the peers end-point.
+   * @param slen        Length of previous storage.
+   * @param data        Vector containing possible handshake data received.
+   *
+   * @return >= 0       New file descriptor.
+   */
+  virtual std::unique_ptr<SocketConnection> getNewClient(
+    struct sockaddr_storage *dst, socklen_t *slen, std::vector<uint8_t> &data,
+    accessCb cb_access) const = 0;
 
   /** @brief Create a new listening socket */
   SocketListener(__socket_type socktype, Socket::sockopts opts,
@@ -159,8 +199,23 @@ class SocketListenerTcp : public SocketListener
 
  protected:
   /** @brief accept a new connection */
-  virtual int getNewClient(struct sockaddr_storage *dst,
-                           socklen_t *slen) const override;
+  virtual std::unique_ptr<SocketConnection> getNewClient(
+    struct sockaddr_storage *dst, socklen_t *slen, std::vector<uint8_t> &data,
+    accessCb cb_access) const override;
+};
+
+class SocketListenerUdp : public SocketListener
+{
+public:
+   /** @brief Create a new UDP socket that only listens */
+  SocketListenerUdp(const struct sockaddr_storage *saddr = &Socket::inAnyAddr,
+                    socklen_t slen = Socket::inAnyAddrLen);
+
+ protected:
+  /** @brief Accept a new UDP connection */
+  virtual std::unique_ptr<SocketConnection> getNewClient(
+    struct sockaddr_storage *dst, socklen_t *slen, std::vector<uint8_t> &data,
+    accessCb cb_access) const override;
 };
 
 } // namespace Sukat

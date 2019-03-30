@@ -4,17 +4,21 @@
 
 class SukatSocketTest : public ::testing::Test
 {
-protected:
-  SukatSocketTest() {
+ protected:
+  SukatSocketTest()
+  {
   }
 
-  virtual ~SukatSocketTest() {
+  virtual ~SukatSocketTest()
+  {
   }
 
-  virtual void SetUp() {
+  virtual void SetUp()
+  {
   }
 
-  virtual void TearDown() {
+  virtual void TearDown()
+  {
   }
 };
 
@@ -32,7 +36,8 @@ TEST_F(SukatSocketTest, SukatSocketTestInit)
   Sukat::SocketConnection client(SOCK_STREAM, *saddr, slen);
 
   ret = tcp_listener.acceptNew(
-    [&](std::unique_ptr<Sukat::SocketConnection> &&conn) {
+    [&](std::unique_ptr<Sukat::SocketConnection> &&conn,
+        __attribute__((unused)) std::vector<uint8_t> data) {
       EXPECT_NE(nullptr, conn);
       conn_from_server = std::move(conn);
     });
@@ -62,8 +67,64 @@ TEST_F(SukatSocketTest, SukatSocketTestInit)
   EXPECT_EQ(data, readData.str());
 }
 
-int main(int argc, char **argv) {
+TEST_F(SukatSocketTest, SukatSocketTestUdp)
+{
+  Sukat::SocketListenerUdp udp_listener;
+  socklen_t slen;
+  const struct sockaddr_storage *saddr = udp_listener.getSource(&slen);
+  std::unique_ptr<Sukat::SocketConnection> conn_from_server(nullptr);
+  std::string hello("Hello from client");
+  int ret;
+
+  Sukat::SocketConnection client(SOCK_DGRAM, *saddr, slen);
+
+  ret = client.writeData(reinterpret_cast<const uint8_t *>(hello.c_str()),
+                         hello.length());
+  EXPECT_EQ(ret, hello.length());
+
+  ret = udp_listener.acceptNew(
+    [&](std::unique_ptr<Sukat::SocketConnection> &&conn,
+        __attribute__((unused)) std::vector<uint8_t> data) {
+      EXPECT_NE(nullptr, conn);
+      conn_from_server = std::move(conn);
+    },
+    [&](const struct sockaddr_storage *peer, socklen_t peer_len,
+        std::vector<uint8_t> &data) -> Sukat::SocketListener::accessReturn {
+      std::string strdata(data.begin(), data.end());
+      socklen_t client_source_len;
+      const struct sockaddr_in6 *client_source =
+                                  reinterpret_cast<const struct sockaddr_in6 *>(
+                                    client.getSource(&client_source_len)),
+                                *peer6 =
+                                  reinterpret_cast<const struct sockaddr_in6 *>(
+                                    peer);
+
+      EXPECT_EQ(peer_len, client_source_len);
+      EXPECT_EQ(peer->ss_family, AF_INET6);
+      EXPECT_EQ(peer6->sin6_port, client_source->sin6_port);
+      /* For some reason the server side gets :: and client side gets ::1
+      EXPECT_EQ(0, memcmp(&peer6->sin6_addr, &client_source->sin6_addr,
+                          sizeof(peer6->sin6_addr)));
+      */
+      EXPECT_EQ(hello, strdata);
+      return Sukat::SocketListener::accessReturn::ACCESS_NEW;
+    });
+
+  EXPECT_NE(nullptr, conn_from_server);
+
+  hello = "Hello from server";
+  ret = conn_from_server->writeData(
+    reinterpret_cast<const uint8_t *>(hello.c_str()), hello.length());
+  EXPECT_EQ(ret, hello.length());
+
+  auto reply = client.readData();
+  EXPECT_EQ(hello, reply.str());
+}
+
+int main(int argc, char **argv)
+{
   Sukat::Logger::initialize(Sukat::Logger::LogLevel::DEBUG);
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
