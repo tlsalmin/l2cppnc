@@ -42,7 +42,7 @@ Socket::Socket(int socktype, Socket::sockopts sockopts,
       memcpy(&mSource, src, mSourceLen);
     }
 
-  Logger::Dbg("Creating socket family: ", mSource.ss_family, ", type: ",
+  LOG_DBG("Creating socket family: ", mSource.ss_family, ", type: ",
               socktype, ", socklen: ", mSourceLen);
 
   mFd = ::socket(mSource.ss_family, socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -70,7 +70,7 @@ Socket::Socket(int socktype, Socket::sockopts sockopts,
             }
           else
             {
-              Logger::Dbg("Created socket: ", this);
+              LOG_DBG("Created socket: ", this);
               return;
             }
         }
@@ -97,7 +97,7 @@ Socket::~Socket()
 {
   int retry = 5;
 
-  Logger::Dbg("Closing socket ", this);
+  LOG_DBG("Closing socket ", this);
   while (::close(mFd) == -1 && --retry)
     {
       // Generate a core for bad fd investigating.
@@ -126,7 +126,7 @@ SocketConnection::SocketConnection(int socktype,
   memcpy(&mDestination, &dst, sizeof(mDestination));
   if (!connect(fd(), reinterpret_cast<const struct sockaddr *>(&dst), slen))
     {
-      Logger::Dbg("Connected socket ", this);
+      LOG_DBG("Connected socket ", this);
       complete = true;
     }
   else if (errno != EINPROGRESS)
@@ -135,7 +135,7 @@ SocketConnection::SocketConnection(int socktype,
     }
   else
     {
-      Logger::Dbg("Connection in progress in socket ", this);
+      LOG_DBG("Connection in progress in socket ", this);
       // TCP handshake in progress.
     }
 }
@@ -148,7 +148,7 @@ std::stringstream SocketConnection::readData() const
 
   while ((ret = ::recv(fd(), buf, sizeof(buf), 0)) > 0)
     {
-      Logger::Dbg("Read ", ret, " bytes from ", this);
+      LOG_DBG("Read ", ret, " bytes from ", this);
       data.write(buf, ret);
     }
   if (!(ret == -1 &&
@@ -183,7 +183,7 @@ bool SocketConnection::finish()
             mDestinationLen);
   if (!ret || (ret == -1 && errno == EINPROGRESS))
     {
-      Logger::Dbg("Connection ", this,
+      LOG_DBG("Connection ", this,
                   (complete) ? "in progress" : " finished");
       complete = (ret != -1);
     }
@@ -204,8 +204,8 @@ unsigned int SocketListener::acceptNew(
 
   while ((ret = getNewClient(&addr, &len)) != -1)
     {
-      Logger::Dbg("New fd: ", ret,
-                  ", connected from: ", saddr_to_string(&addr, len));
+      LOG_DBG("New fd: ", ret,
+              ", connected from: ", saddr_to_string(&addr, len));
       new_fn(std::make_unique<SocketConnection>(ret, *this, len, &addr));
       len = sizeof(addr);
       count++;
@@ -220,7 +220,7 @@ SocketListenerTcp::SocketListenerTcp(const struct sockaddr_storage *saddr,
 {
   if (!listen(fd(), 16))
     {
-      Logger::Dbg("Listening on: ", this);
+      LOG_DBG("Listening on: ", this);
       // Success.
     }
   else

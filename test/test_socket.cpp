@@ -63,6 +63,7 @@ TEST_F(SukatSocketTest, SukatSocketTestInit)
 }
 
 int main(int argc, char **argv) {
+  Sukat::Logger::initialize(Sukat::Logger::LogLevel::DEBUG);
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
