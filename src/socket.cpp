@@ -72,6 +72,8 @@ Socket::Socket(int socktype, Socket::sockopts sockopts,
         {
           e = std::system_error(errno, std::system_category(), "bind");
         }
+      close(mFd);
+      mFd = -1;
     }
   else
     {
@@ -89,24 +91,27 @@ Socket::Socket(int fd, const struct sockaddr_storage *src, socklen_t src_len)
 
 Socket::~Socket()
 {
-  int retry = 5;
-
-  LOG_DBG("Closing socket ", this);
-  while (::close(mFd) == -1 && --retry)
+  if (mFd != -1)
     {
-      // Generate a core for bad fd investigating.
-      assert(errno != EBADFD);
+      int retry = 5;
+
+      LOG_DBG("Closing socket ", this);
+      while (::close(mFd) == -1 && --retry)
+        {
+          // Generate a core for bad fd investigating.
+          assert(errno != EBADFD);
+        }
     }
 }
 
 void Socket::addToEfd(int efd) const
 {
-  struct epoll_event ev = {};
-
-  ev.data.fd = mFd;
-  ev.events = EPOLLIN;
-
-  if (epoll_ctl(efd, EPOLL_CTL_ADD, mFd, &ev))
+  if (struct epoll_event ev =
+        {
+          .events = EPOLLIN,
+          .data = {.fd = mFd},
+        };
+      epoll_ctl(efd, EPOLL_CTL_ADD, mFd, &ev))
     {
       throw std::system_error(errno, std::system_category(), "Epoll add");
     }
@@ -198,13 +203,12 @@ SocketConnection::SocketConnection(int socktype, sockopts opts,
 
 bool SocketConnection::finish()
 {
-  int ret =
-    connect(fd(), reinterpret_cast<const struct sockaddr *>(&mDestination),
-            mDestinationLen);
-  if (!ret || (ret == -1 && errno == EINPROGRESS))
+  if (int ret =
+        connect(fd(), reinterpret_cast<const struct sockaddr *>(&mDestination),
+                mDestinationLen);
+      !ret || (ret == -1 && errno == EINPROGRESS))
     {
-      LOG_DBG("Connection ", this,
-                  (complete) ? "in progress" : " finished");
+      LOG_DBG("Connection ", this, (complete) ? "in progress" : " finished");
       complete = (ret != -1);
     }
   else
@@ -254,14 +258,12 @@ std::unique_ptr<SocketConnection> SocketListenerTcp::getNewClient(
   struct sockaddr_storage *dst, socklen_t *slen,
   __attribute__((unused)) std::vector<uint8_t> &data, accessCb cb_access) const
 {
-  int new_fd = ::accept4(fd(), reinterpret_cast<struct sockaddr *>(dst), slen,
-                         SOCK_NONBLOCK | SOCK_CLOEXEC);
-
-  if (new_fd != -1)
+  if (int new_fd = ::accept4(fd(), reinterpret_cast<struct sockaddr *>(dst),
+                             slen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+      new_fd != -1)
     {
-      std::vector<uint8_t> empty_handshake(0);
-
-      if (!cb_access || cb_access(dst, *slen, empty_handshake) ==
+      if (std::vector<uint8_t> empty_handshake(0);
+          !cb_access || cb_access(dst, *slen, empty_handshake) ==
                           SocketListener::accessReturn::ACCESS_NEW)
         {
           return std::make_unique<SocketConnection>(new_fd, *this, *slen, dst);
@@ -297,7 +299,6 @@ std::unique_ptr<SocketConnection> SocketListenerUdp::getNewClient(
   struct sockaddr_storage *dst, socklen_t *slen, std::vector<uint8_t> &data,
   accessCb cb_access) const
 {
-  int ret;
   struct iovec iov =
     {
       .iov_base = data.data(),
@@ -314,8 +315,7 @@ std::unique_ptr<SocketConnection> SocketListenerUdp::getNewClient(
       .msg_flags = 0
     };
 
-  ret = ::recvmsg(fd(), &hdr, 0);
-  if (ret >= 0)
+  if (int ret = ::recvmsg(fd(), &hdr, 0); ret >= 0)
     {
       SocketListener::accessReturn access_ret =
         SocketListener::accessReturn::ACCESS_NEW;
