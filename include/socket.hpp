@@ -47,6 +47,9 @@ class Socket
     return mFd;
   }
 
+  /** @brief Checks if object can accept new connections */
+  virtual bool canAccept() const = 0;
+
   /** @brief Add given socket to epoll fd */
   void addToEfd(int efd) const;
 
@@ -115,6 +118,11 @@ class SocketConnection : public Socket
     return complete;
   };
 
+  virtual bool canAccept() const override
+  {
+     return false;
+  };
+
   /** @brief Finish the connection (3-way handshake on TCP */
   bool finish();
 
@@ -168,6 +176,11 @@ class SocketListener : public Socket
    * @return Number of accepted connections.
    */
   unsigned int acceptNew(newClientCb cbj, accessCb cb_access = nullptr) const;
+
+  virtual bool canAccept() const override
+  {
+     return true;
+  };
 
  protected:
   /**
