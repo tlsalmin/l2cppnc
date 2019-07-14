@@ -32,6 +32,15 @@ class Logger
                    [&]() { log_instance.reset(new Logger(lvl, logfile)); });
   }
 
+  static void initialize(int lvl, std::string logfile = "")
+  {
+    if (lvl > static_cast<int>(LogLevel::DEBUG))
+      {
+        lvl = static_cast<int>(LogLevel::DEBUG);
+      }
+    initialize(static_cast<LogLevel>(lvl), logfile);
+  }
+
   template<typename... Args>
     static void Log(LogLevel lvl, std::string_view file, int line, Args... args)
       {

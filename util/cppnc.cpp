@@ -1,15 +1,18 @@
 #include <system_error>
 
-#include "socket.hpp"
+#include "epoll.hpp"
 #include "logging.hpp"
+#include "socket.hpp"
 
 extern "C"
 {
 #include <assert.h>
+#include <getopt.h>
 #include <netdb.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
 }
 
 using namespace Sukat;
@@ -17,174 +20,198 @@ using namespace Sukat;
 class NetCat
 {
   std::map<int, std::unique_ptr<Sukat::Socket>> conns;
-  int efd;
+  Sukat::Epoll epIn, epOut, epMain;
 
  public:
-  NetCat(std::string log_file = "", Logger::LogLevel lvl =
-         Logger::LogLevel::ERROR)
-    : efd(epoll_create1(EPOLL_CLOEXEC))
+  NetCat()
   {
-    std::system_error e;
-    int ret;
-
-    Logger::initialize(lvl, log_file);
-    if (struct epoll_event ev = {.events = EPOLLIN,
-                                 .data = {.fd = STDIN_FILENO}};
-        (ret = epoll_ctl(efd, EPOLL_CTL_ADD, STDIN_FILENO, &ev)) != -1)
+    if (!epMain.ctl(epIn.fd()) || !epMain.ctl(epOut.fd()))
       {
-        LOG_INF("Created Netcat instance");
-        return;
+        throw std::system_error(errno, std::system_category(),
+                                "Failed to bind efds");
       }
-    else
-      {
-        e = std::system_error(ret, std::system_category(),
-                              "Failed to listen on stdin");
-      }
-    throw e;
   }
 
-  int connect(int type, const std::string &dst, const std::string &port)
+  void registerStdin()
   {
-    std::system_error e;
-    struct addrinfo hints = {}, *res = NULL;
-    int ret;
-
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = type;
-
-    if (ret = getaddrinfo(dst.c_str(), port.c_str(), &hints, &res); ret != -1)
+    if (!epIn.ctl(STDIN_FILENO))
       {
-        struct addrinfo *iter;
+        throw std::system_error(errno, std::system_category(),
+                                "Failed to register stdin");
+      }
+  }
 
-        for (iter = res; iter; iter = iter->ai_next)
+  auto connect(const std::string &dst, const std::string &port,
+               int type = SOCK_STREAM)
+  {
+    AddrInfo endpoint(dst, port, {}, type);
+    auto new_conn =
+      std::make_unique<SocketConnection>(endpoint.mResults.front());
+    auto [ret, inserted] =
+      conns.insert(std::pair<int, std::unique_ptr<SocketConnection>>(
+        new_conn->fd(), std::move(new_conn)));
+    assert(inserted);
+    const bool connected =
+      dynamic_cast<SocketConnection *>(ret->second.get())->connComplete();
+    const auto &efdTarget = (connected) ? epIn : epOut;
+    const auto events = (connected) ? EPOLLIN : EPOLLOUT;
+    int fd = ret->second->fd();
+
+    if (!efdTarget.ctl(fd, EPOLL_CTL_ADD, events))
+      {
+        throw std::system_error(errno, std::system_category(),
+                                "Failed to register fd");
+      }
+    else if (connected)
+      {
+        // Ready to send stuff from stdin.
+        registerStdin();
+      }
+
+    return ret->second.get();
+  }
+
+  ~NetCat() = default;
+
+  std::optional<int> process(int timeout)
+  {
+    return epMain.wait(
+      [&](const struct epoll_event &ev) {
+        if (ev.data.fd == epOut.fd())
           {
-            if (std::unique_ptr<SocketConnection> conn(new SocketConnection(
-                  type,
-                  reinterpret_cast<const struct sockaddr_storage &>(
-                    *res->ai_addr),
-                  res->ai_addrlen));
-                conn != nullptr)
-              {
-                struct epoll_event ev = {
-                  .events = EPOLLIN,
-                  .data = {.fd = STDIN_FILENO}};
+            return epOut.wait(
+              [&](const struct epoll_event &ev) -> std::optional<int> {
+                if (auto &iter = conns.at(ev.data.fd))
+                  {
+                    int ret;
 
-                if (!conn->ready())
-                  {
-                    ev.events |= EPOLLOUT;
+                    if (ev.events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP))
+                      {
+                        LOG_ERR("Failed to connect to ", iter.get(), " events ",
+                                Epoll::event_to_string(ev));
+                      }
+                    else if ((ret =
+                                dynamic_cast<SocketConnection *>((iter).get())
+                                  ->polloutReady()))
+                      {
+                        LOG_ERR("Failed to finalize connection: ",
+                                strerror(ret));
+                      }
+                    else if (!epOut.ctl(iter->fd(), EPOLL_CTL_DEL) ||
+                             !epIn.ctl(iter->fd()))
+                      {
+                        LOG_ERR("Failed to modify epoll after connect finish");
+                      }
+                    else
+                      {
+                        registerStdin();
+                        // All good.
+                        return {};
+                      }
+                    return std::make_optional<int>(-1);
                   }
-
-                if (ret = epoll_ctl(efd, EPOLL_CTL_ADD, conn->fd(), &ev);
-                    ret != -1)
-                  {
-                    ret = 0;
-                    break;
-                  }
-                else
-                  {
-                    e = std::system_error(ret, std::system_category(),
-                                          "Failed to epoll");
-                  }
-              }
-            else
-              {
-                e = std::system_error(ret, std::system_category(),
-                                      "Failed to create connection");
-              }
+                return {};
+              },
+              timeout);
           }
-        freeaddrinfo(res);
-      }
-    else
-      {
-        e = std::system_error(ret, std::system_category(), "Failed to solve");
-      }
-    if (ret == -1)
-      {
-        throw e;
-      }
-    return ret;
-  }
-
-  ~NetCat()
-  {
-    close(efd);
-  };
-
-  int process(int timeout)
-  {
-    struct epoll_event ev[2];
-    int ret;
-
-    ret = epoll_wait(efd, ev, 2, timeout);
-    if (ret >= 0)
-      {
-        unsigned int i;
-        unsigned int n_events = ret;
-
-        for (i = 0; i < n_events; i++)
+        else if (ev.data.fd == epIn.fd())
           {
-            if (ev[i].data.fd == STDIN_FILENO)
-              {
-                char buf[BUFSIZ];
-
-                ret = read(STDIN_FILENO, buf, sizeof(buf));
-                if (ret > 0)
+            LOG_DBG("Data in epIn ", epIn.fd());
+            return epIn.wait(
+              [&](const struct epoll_event &ev) -> std::optional<int> {
+                if (auto &iter = conns.at(ev.data.fd))
                   {
-                    //conns.send_yall(std::string(buf, ret));
+                    auto data =
+                      dynamic_cast<SocketConnection *>(iter.get())->readData();
+                    std::cout << data.str() << std::endl;
+                    ;
                   }
-                else
+                else if (ev.data.fd == STDIN_FILENO)
                   {
-                    std::cout << "stdin closed" << std::endl;
-                    ret = -1;
+                    std::ostringstream data;
+                    data << std::cin.rdbuf();
+                    for (const auto &conn : conns)
+                      {
+                      //TODO This needs a better way.
+                        auto *connection =
+                          dynamic_cast<SocketConnection *>(conn.second.get());
+                        if (connection->ready())
+                          {
+                            connection->writeData(
+                              reinterpret_cast<const uint8_t *>(
+                                data.str().c_str()),
+                              data.str().length());
+                          }
+                      }
+                    return {};
                   }
-              }
-            else
-              {
-                //ret = conns.process(0);
-              }
+                return std::make_optional<int>(-1);
+              },
+              timeout);
           }
-      }
-    return ret;
-  };
-
-  void read_cb(__attribute__((unused)) int id, const std::stringstream &data)
-  {
-    std::cout << data.str();
+        abort(); // Not reached.
+      },
+      timeout);
   }
-
-  void connected(int id)
-  {
-    std::cout << "Connection " << std::to_string(id) << " ready!" << std::endl;
-  };
 };
+
+void usage(const std::string bin)
+{
+  std::cout << bin << ": Netcat utility." << std::endl;
+  std::cout << "Usage: " << bin << " <IP> "
+            << " <Port>" << std::endl;
+  std::cout << "Options: " << std::endl;
+  std::cout << "  -h    This help" << std::endl;
+  std::cout << "  -v    Increase verbosity" << std::endl;
+}
 
 int main(int argc, char *argv[])
 {
   int exit_ret = EXIT_FAILURE;
   std::string dst, port, src;
+  int c;
+  int log_lvl = static_cast<int>(Sukat::Logger::LogLevel::ERROR);
 
-  if (argc >= 3)
+  while ((c = getopt(argc, argv, "vh")) != -1)
     {
-      dst = std::string(argv[1]);
-      port = std::string(argv[2]);
+      switch (c)
+        {
+          case 'v':
+            ++log_lvl;
+            break;
+          default:
+            std::cerr << "Unknown argument " << c << std::endl;
+            [[fallthrough]];
+          case 'h':
+            usage(argv[0]);
+            break;
+        }
+    }
+
+  Logger::initialize(log_lvl);
+
+  if (optind + 1 < argc)
+    {
+      dst = std::string(argv[optind]);
+      port = std::string(argv[optind + 1]);
       try
         {
-          int ret;
-
           NetCat catter;
+          std::optional<int> ret;
 
-          std::cout << "Ready to rock" << std::endl;
+          LOG_DBG("Ready to connect");
+          auto conn = catter.connect(dst, port);
           exit_ret = EXIT_SUCCESS;
           do
             {
               ret = catter.process(-1);
             }
-          while (ret >= 0);
+          while (!ret.has_value());
         }
       catch (std::system_error &e)
         {
-          std::cerr << "Failed to connect to " << dst << "port : " << port
-                    << e.what() << ": ";
+          std::cerr << "Failed to connect to " << dst << " port : " << port
+                    << " " << e.what() << ": ";
           std::cerr << strerror(e.code().value());
           std::cerr << std::endl;
         }

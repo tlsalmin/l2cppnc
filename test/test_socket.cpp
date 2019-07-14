@@ -24,18 +24,16 @@ class SukatSocketTest : public ::testing::Test
 
 TEST_F(SukatSocketTest, SukatSocketTestInit)
 {
-  struct sockaddr_storage saddr;
-  socklen_t slen = sizeof(saddr);
   std::string data;
   Sukat::SocketListenerTcp tcp_listener;
   int ret;
   bool bret;
   std::unique_ptr<Sukat::SocketConnection> conn_from_server(nullptr);
 
-  bret = tcp_listener.getSource(saddr, slen);
-  EXPECT_EQ(true, bret);
+  auto saddr = tcp_listener.getSource();
+  EXPECT_TRUE(saddr);
 
-  Sukat::SocketConnection client(SOCK_STREAM, saddr, slen);
+  Sukat::SocketConnection client(SOCK_STREAM, saddr.value());
 
   ret = tcp_listener.acceptNew(
     [&](Sukat::SocketConnection &&conn,
@@ -69,17 +67,14 @@ TEST_F(SukatSocketTest, SukatSocketTestInit)
 TEST_F(SukatSocketTest, SukatSocketTestUdp)
 {
   Sukat::SocketListenerUdp udp_listener;
-  struct sockaddr_storage saddr;
-  bool bret;
-  socklen_t slen = sizeof(saddr);
   std::unique_ptr<Sukat::SocketConnection> conn_from_server(nullptr);
   std::string hello("Hello from client");
   int ret;
 
-  bret = udp_listener.getSource(saddr, slen);
-  EXPECT_EQ(true, bret);
+  auto saddr = udp_listener.getSource();
+  EXPECT_TRUE(saddr);
 
-  Sukat::SocketConnection client(SOCK_DGRAM, saddr, slen);
+  Sukat::SocketConnection client(SOCK_DGRAM, saddr.value());
 
   ret = client.writeData(reinterpret_cast<const uint8_t *>(hello.c_str()),
                          hello.length());
@@ -92,24 +87,21 @@ TEST_F(SukatSocketTest, SukatSocketTestUdp)
         std::make_unique<Sukat::SocketConnection>(std::move(conn));
       EXPECT_NE(nullptr, conn_from_server);
     },
-    [&](const struct sockaddr_storage *peer, socklen_t peer_len,
+    [&](const Sukat::Socket::endpoint &peer,
         std::vector<uint8_t> &data) -> Sukat::SocketListener::accessReturn {
       std::string strdata(data.begin(), data.end());
-      struct sockaddr_storage client_saddr;
-      socklen_t client_source_len = sizeof(client_saddr);
+      auto client_saddr = client.getSource();
+      EXPECT_TRUE(client_saddr);
       const struct sockaddr_in6 *client_source =
                                   reinterpret_cast<const struct sockaddr_in6 *>(
-                                    &client_saddr),
+                                    &client_saddr.value().first),
                                 *peer6 =
                                   reinterpret_cast<const struct sockaddr_in6 *>(
-                                    peer);
+                                    &peer.first);
 
-      bool local_bret = client.getSource(client_saddr, client_source_len);
 
-      EXPECT_EQ(true, local_bret);
-
-      EXPECT_EQ(peer_len, client_source_len);
-      EXPECT_EQ(peer->ss_family, AF_INET6);
+      EXPECT_EQ(peer.second, client_saddr.value().second);
+      EXPECT_EQ(peer.first.ss_family, AF_INET6);
       EXPECT_EQ(peer6->sin6_port, client_source->sin6_port);
       /* For some reason the server side gets :: and client side gets ::1
       EXPECT_EQ(0, memcmp(&peer6->sin6_addr, &client_source->sin6_addr,
