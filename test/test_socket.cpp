@@ -24,31 +24,30 @@ class SukatSocketTest : public ::testing::Test
 
 TEST_F(SukatSocketTest, SukatSocketTestInit)
 {
-  socklen_t slen;
+  struct sockaddr_storage saddr;
+  socklen_t slen = sizeof(saddr);
   std::string data;
   Sukat::SocketListenerTcp tcp_listener;
   int ret;
-  const struct sockaddr_storage *saddr = tcp_listener.getSource(&slen);
+  bool bret;
   std::unique_ptr<Sukat::SocketConnection> conn_from_server(nullptr);
 
-  EXPECT_NE(nullptr, saddr);
+  bret = tcp_listener.getSource(saddr, slen);
+  EXPECT_EQ(true, bret);
 
-  Sukat::SocketConnection client(SOCK_STREAM, *saddr, slen);
+  Sukat::SocketConnection client(SOCK_STREAM, saddr, slen);
 
   ret = tcp_listener.acceptNew(
-    [&](std::unique_ptr<Sukat::SocketConnection> &&conn,
+    [&](Sukat::SocketConnection &&conn,
         __attribute__((unused)) std::vector<uint8_t> data) {
-      EXPECT_NE(nullptr, conn);
-      conn_from_server = std::move(conn);
+      conn_from_server = std::make_unique<Sukat::SocketConnection>(std::move(conn));
+      EXPECT_NE(nullptr, conn_from_server);
     });
   EXPECT_GT(ret, 0);
   EXPECT_NE(nullptr, conn_from_server);
 
-  while (!client.ready())
-    {
-      bool bret = client.finish();
-      EXPECT_EQ(true, bret);
-    }
+  bret = client.ready(10);
+  EXPECT_EQ(true, bret);
 
   data = "hello from server";
   ret = conn_from_server->writeData(
@@ -70,34 +69,44 @@ TEST_F(SukatSocketTest, SukatSocketTestInit)
 TEST_F(SukatSocketTest, SukatSocketTestUdp)
 {
   Sukat::SocketListenerUdp udp_listener;
-  socklen_t slen;
-  const struct sockaddr_storage *saddr = udp_listener.getSource(&slen);
+  struct sockaddr_storage saddr;
+  bool bret;
+  socklen_t slen = sizeof(saddr);
   std::unique_ptr<Sukat::SocketConnection> conn_from_server(nullptr);
   std::string hello("Hello from client");
   int ret;
 
-  Sukat::SocketConnection client(SOCK_DGRAM, *saddr, slen);
+  bret = udp_listener.getSource(saddr, slen);
+  EXPECT_EQ(true, bret);
+
+  Sukat::SocketConnection client(SOCK_DGRAM, saddr, slen);
 
   ret = client.writeData(reinterpret_cast<const uint8_t *>(hello.c_str()),
                          hello.length());
   EXPECT_EQ(ret, hello.length());
 
   ret = udp_listener.acceptNew(
-    [&](std::unique_ptr<Sukat::SocketConnection> &&conn,
+    [&](Sukat::SocketConnection &&conn,
         __attribute__((unused)) std::vector<uint8_t> data) {
-      EXPECT_NE(nullptr, conn);
-      conn_from_server = std::move(conn);
+      conn_from_server =
+        std::make_unique<Sukat::SocketConnection>(std::move(conn));
+      EXPECT_NE(nullptr, conn_from_server);
     },
     [&](const struct sockaddr_storage *peer, socklen_t peer_len,
         std::vector<uint8_t> &data) -> Sukat::SocketListener::accessReturn {
       std::string strdata(data.begin(), data.end());
-      socklen_t client_source_len;
+      struct sockaddr_storage client_saddr;
+      socklen_t client_source_len = sizeof(client_saddr);
       const struct sockaddr_in6 *client_source =
                                   reinterpret_cast<const struct sockaddr_in6 *>(
-                                    client.getSource(&client_source_len)),
+                                    &client_saddr),
                                 *peer6 =
                                   reinterpret_cast<const struct sockaddr_in6 *>(
                                     peer);
+
+      bool local_bret = client.getSource(client_saddr, client_source_len);
+
+      EXPECT_EQ(true, local_bret);
 
       EXPECT_EQ(peer_len, client_source_len);
       EXPECT_EQ(peer->ss_family, AF_INET6);

@@ -1,6 +1,7 @@
 #include <system_error>
 
 #include "socket.hpp"
+#include "logging.hpp"
 
 extern "C"
 {
@@ -11,61 +12,84 @@ extern "C"
 #include <sys/types.h>
 }
 
+using namespace Sukat;
+
 class NetCat
 {
-  Connections<NetCat> conns;
-  int main_fd;
+  std::map<int, std::unique_ptr<Sukat::Socket>> conns;
   int efd;
 
  public:
-  NetCat(std::string &dst, std::string &port, std::string &src,
-         int type = SOCK_STREAM)
-    : conns(this, std::mem_fn(&NetCat::connected),
-            std::mem_fn(&NetCat::read_cb))
+  NetCat(std::string log_file = "", Logger::LogLevel lvl =
+         Logger::LogLevel::ERROR)
+    : efd(epoll_create1(EPOLL_CLOEXEC))
   {
-    struct epoll_event ev = {};
     std::system_error e;
-    struct addrinfo hints = {}, *res;
     int ret;
 
-    efd = epoll_create1(EPOLL_CLOEXEC);
-    // Just do it.
-    assert(efd != -1);
-    ev.data.fd = STDIN_FILENO;
-    ev.events = EPOLLIN;
+    Logger::initialize(lvl, log_file);
+    if (struct epoll_event ev = {.events = EPOLLIN,
+                                 .data = {.fd = STDIN_FILENO}};
+        (ret = epoll_ctl(efd, EPOLL_CTL_ADD, STDIN_FILENO, &ev)) != -1)
+      {
+        LOG_INF("Created Netcat instance");
+        return;
+      }
+    else
+      {
+        e = std::system_error(ret, std::system_category(),
+                              "Failed to listen on stdin");
+      }
+    throw e;
+  }
+
+  int connect(int type, const std::string &dst, const std::string &port)
+  {
+    std::system_error e;
+    struct addrinfo hints = {}, *res = NULL;
+    int ret;
+
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = type;
 
-    ret = epoll_ctl(efd, EPOLL_CTL_ADD, STDIN_FILENO, &ev);
-    assert(!ret);
-
-    ev.data.fd = conns.get_efd();
-    ev.events = EPOLLIN;
-    ret = epoll_ctl(efd, EPOLL_CTL_ADD, ev.data.fd, &ev);
-    assert(!ret);
-
-    ret = getaddrinfo(dst.c_str(), port.c_str(), &hints, &res);
-    if (!ret)
+    if (ret = getaddrinfo(dst.c_str(), port.c_str(), &hints, &res); ret != -1)
       {
-        int src_ret;
-        struct addrinfo *src_res = nullptr;
+        struct addrinfo *iter;
 
-        if (src.empty() || !(src_ret = getaddrinfo(src.c_str(), port.c_str(),
-                                                   &hints, &src_res)))
+        for (iter = res; iter; iter = iter->ai_next)
           {
-            main_fd = conns.connect_to_endpoint(res, src_res);
-
-            if (main_fd != -1)
+            if (std::unique_ptr<SocketConnection> conn(new SocketConnection(
+                  type,
+                  reinterpret_cast<const struct sockaddr_storage &>(
+                    *res->ai_addr),
+                  res->ai_addrlen));
+                conn != nullptr)
               {
+                struct epoll_event ev = {
+                  .events = EPOLLIN,
+                  .data = {.fd = STDIN_FILENO}};
+
+                if (!conn->ready())
+                  {
+                    ev.events |= EPOLLOUT;
+                  }
+
+                if (ret = epoll_ctl(efd, EPOLL_CTL_ADD, conn->fd(), &ev);
+                    ret != -1)
+                  {
+                    ret = 0;
+                    break;
+                  }
+                else
+                  {
+                    e = std::system_error(ret, std::system_category(),
+                                          "Failed to epoll");
+                  }
               }
             else
               {
                 e = std::system_error(ret, std::system_category(),
-                                      "Failed to connect");
-              }
-            if (src_res)
-              {
-                freeaddrinfo(src_res);
+                                      "Failed to create connection");
               }
           }
         freeaddrinfo(res);
@@ -74,11 +98,13 @@ class NetCat
       {
         e = std::system_error(ret, std::system_category(), "Failed to solve");
       }
-    if (main_fd == -1)
+    if (ret == -1)
       {
         throw e;
       }
-  };
+    return ret;
+  }
+
   ~NetCat()
   {
     close(efd);
@@ -104,7 +130,7 @@ class NetCat
                 ret = read(STDIN_FILENO, buf, sizeof(buf));
                 if (ret > 0)
                   {
-                    conns.send_yall(std::string(buf, ret));
+                    //conns.send_yall(std::string(buf, ret));
                   }
                 else
                   {
@@ -114,7 +140,7 @@ class NetCat
               }
             else
               {
-                ret = conns.process(0);
+                //ret = conns.process(0);
               }
           }
       }
@@ -145,7 +171,7 @@ int main(int argc, char *argv[])
         {
           int ret;
 
-          NetCat catter(dst, port, src);
+          NetCat catter;
 
           std::cout << "Ready to rock" << std::endl;
           exit_ret = EXIT_SUCCESS;

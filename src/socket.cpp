@@ -7,6 +7,20 @@ extern "C"
 
 using namespace Sukat;
 
+Fd::~Fd()
+{
+  if (mFd != -1)
+    {
+      int retry = 5;
+
+      while (::close(mFd) == -1 && --retry)
+        {
+          // Generate a core for bad fd investigating.
+          assert(errno != EBADFD);
+        }
+    }
+}
+
 std::string Sukat::saddr_to_string(const struct sockaddr_storage *addr,
                                    socklen_t len)
 {
@@ -32,48 +46,34 @@ const Socket::sockopts Socket::defaultSockopts =
   std::set{std::make_pair<int, int>(SO_REUSEADDR, 1)};
 
 Socket::Socket(int socktype, Socket::sockopts sockopts,
-               const struct sockaddr_storage *src, socklen_t src_len)
-     : mSourceLen(sizeof(mSource))
+               const struct sockaddr_storage *src, socklen_t src_len) :
+  mFd(::socket(src->ss_family, socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, 0))
 {
   std::system_error e;
 
   LOG_DBG("Creating socket family: ", src->ss_family, ", type: ",
               socktype, ", socklen: ", src_len);
 
-  mFd = ::socket(src->ss_family, socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-  if (mFd != -1)
+  if (mFd.fd() != -1)
     {
       for (const auto &opt : sockopts)
         {
-          if (::setsockopt(mFd, SOL_SOCKET, opt.first, &opt.second,
+          if (::setsockopt(mFd.fd(), SOL_SOCKET, opt.first, &opt.second,
                            sizeof(opt.second)))
             {
               e = std::system_error(errno, std::system_category(), "sockopts");
             }
         }
 
-      if (!bind(mFd, reinterpret_cast<const struct sockaddr *>(src), src_len))
+      if (!bind(mFd.fd(), reinterpret_cast<const struct sockaddr *>(src),
+                src_len))
         {
-          // Extra if already known.
-          if (!getsockname(mFd, reinterpret_cast<struct sockaddr *>(&mSource),
-                           &mSourceLen))
-
-            {
-              LOG_DBG("Created socket: ", this);
-              return;
-            }
-          else
-            {
-              e =
-                std::system_error(errno, std::system_category(), "getsockname");
-            }
+          return;
         }
       else
         {
           e = std::system_error(errno, std::system_category(), "bind");
         }
-      close(mFd);
-      mFd = -1;
     }
   else
     {
@@ -82,49 +82,45 @@ Socket::Socket(int socktype, Socket::sockopts sockopts,
   throw(e);
 }
 
-Socket::Socket(int fd, const struct sockaddr_storage *src, socklen_t src_len)
-  :  mSourceLen(src_len), mFd(fd)
-{
-  ::memset(&mSource, 0, sizeof(mSource));
-  ::memcpy(&mSource, src, mSourceLen);
-}
-
 Socket::~Socket()
 {
-  if (mFd != -1)
-    {
-      int retry = 5;
-
-      LOG_DBG("Closing socket ", this);
-      while (::close(mFd) == -1 && --retry)
-        {
-          // Generate a core for bad fd investigating.
-          assert(errno != EBADFD);
-        }
-    }
+  LOG_DBG("Closing socket ", this);
 }
 
-void Socket::addToEfd(int efd) const
+void Socket::addToEfd(int efd, uint32_t events) const
 {
   if (struct epoll_event ev =
         {
-          .events = EPOLLIN,
-          .data = {.fd = mFd},
+          .events = events,
+          .data = {.fd = mFd.fd()},
         };
-      epoll_ctl(efd, EPOLL_CTL_ADD, mFd, &ev))
+      epoll_ctl(efd, EPOLL_CTL_ADD, mFd.fd(), &ev))
     {
       throw std::system_error(errno, std::system_category(), "Epoll add");
     }
 }
 
+std::ostream &Sukat::operator<<(std::ostream &os, Sukat::Socket const &sock)
+{
+  struct sockaddr_storage saddr;
+  socklen_t saddr_len = sizeof(saddr);
+
+  os << "fd: " << std::to_string(sock.fd());
+  if (!getsockname(sock.fd(), reinterpret_cast<struct sockaddr *>(&saddr),
+                   &saddr_len))
+    {
+      os << ", bound: " << saddr_to_string(&saddr, saddr_len);
+    }
+  return os;
+}
+
 SocketConnection::SocketConnection(int socktype,
                                    const struct sockaddr_storage &dst,
                                    socklen_t slen)
-  : Socket(socktype), mDestinationLen(slen), complete(false)
+  : Socket(socktype), complete(false)
 {
-  memcpy(&mDestination, &dst, sizeof(mDestination));
-  LOG_DBG("Connecting to ", saddr_to_string(&mDestination, mDestinationLen));
-  if (!connect(fd(), reinterpret_cast<const struct sockaddr *>(&dst), slen))
+  LOG_DBG("Connecting to ", saddr_to_string(&dst, slen));
+  if (!::connect(fd(), reinterpret_cast<const struct sockaddr *>(&dst), slen))
     {
       LOG_DBG("Connected socket ", this);
       complete = true;
@@ -165,27 +161,14 @@ int SocketConnection::writeData(const uint8_t *data, size_t len) const
   return ::send(fd(), data, len, 0);
 }
 
-SocketConnection::SocketConnection(int fd, const SocketListener &main,
-                                   socklen_t dst_len,
-                                   const struct sockaddr_storage *dst)
-  : Socket(fd, &main.mSource, main.mSourceLen)
-{
-  ::memset(&mDestination, 0, sizeof(mDestination));
-  if (dst && dst_len)
-    {
-      ::memcpy(&mDestination, dst, dst_len);
-    }
-}
-
 SocketConnection::SocketConnection(int socktype, sockopts opts,
                                    const struct sockaddr_storage &src,
                                    socklen_t slen,
                                    const struct sockaddr_storage &dst,
                                    socklen_t dlen)
-  : Socket(socktype, opts, &src, slen), mDestinationLen(dlen), complete(false)
+  : Socket(socktype, opts, &src, slen), complete(false)
 {
-  memcpy(&mDestination, &dst, sizeof(mDestination));
-  if (!connect(fd(), reinterpret_cast<const struct sockaddr *>(&dst), slen))
+  if (!::connect(fd(), reinterpret_cast<const struct sockaddr *>(&dst), dlen))
     {
       LOG_DBG("Connected socket ", this);
       complete = true;
@@ -201,37 +184,65 @@ SocketConnection::SocketConnection(int socktype, sockopts opts,
     }
 }
 
-bool SocketConnection::finish()
+int SocketConnection::polloutReady() const
 {
-  if (int ret =
-        connect(fd(), reinterpret_cast<const struct sockaddr *>(&mDestination),
-                mDestinationLen);
-      !ret || (ret == -1 && errno == EINPROGRESS))
+  int errcode = 0;
+
+  if (!::setsockopt(fd(), SOL_SOCKET, SO_ERROR, &errcode, sizeof(errcode)))
     {
-      LOG_DBG("Connection ", this, (complete) ? "in progress" : " finished");
-      complete = (ret != -1);
+      return errcode;
     }
   else
     {
-      return false;
+      LOG_ERR("Failed to query ", fd(), " SO_ERROR ", ::strerror(errno));
     }
-  return true;
+  return -1;
+}
+
+bool SocketConnection::ready(int timeout) const
+{
+  bool bret = false;
+  int efd = epoll_create1(EPOLL_CLOEXEC);
+
+  if (efd != -1)
+    {
+      struct epoll_event ev = {
+        .events = EPOLLOUT,
+        .data = {.fd = fd()},
+      };
+
+      if (!epoll_ctl(efd, EPOLL_CTL_ADD, fd(), &ev))
+        {
+          if (epoll_wait(efd, &ev, 1, timeout) > 0)
+            {
+              if (ev.events & EPOLLOUT)
+                {
+                  LOG_DBG("Connection ", this, " finished");
+                  bret = true;
+                }
+            }
+        }
+      else
+        {
+          LOG_ERR("Failed to add ", fd(), " to ", efd, ": ", ::strerror(errno));
+        }
+      close(efd);
+    }
+  return bret;
 }
 
 unsigned int SocketListener::acceptNew(newClientCb cb,
                                        accessCb cb_access) const
 {
-  std::unique_ptr<SocketConnection> ret(nullptr);
   unsigned int count = 0;
   struct sockaddr_storage addr;
   socklen_t len = sizeof(addr);
   std::vector<uint8_t> data(BUFSIZ);
 
-  while ((ret = getNewClient(&addr, &len, data, cb_access)) != nullptr)
+  while (newClientType ret{getNewClient(&addr, &len, data, cb_access)})
     {
-      LOG_DBG("New fd: ", ret->fd(),
-              ", connected from: ", saddr_to_string(&addr, len));
-      cb(std::move(ret), data);
+      LOG_DBG("New client: ", &ret.value());
+      cb(std::move(ret.value()), data);
       len = sizeof(addr);
       count++;
     }
@@ -254,7 +265,7 @@ SocketListenerTcp::SocketListenerTcp(const struct sockaddr_storage *saddr,
     }
 }
 
-std::unique_ptr<SocketConnection> SocketListenerTcp::getNewClient(
+std::optional<SocketConnection> SocketListenerTcp::getNewClient(
   struct sockaddr_storage *dst, socklen_t *slen,
   __attribute__((unused)) std::vector<uint8_t> &data, accessCb cb_access) const
 {
@@ -266,7 +277,7 @@ std::unique_ptr<SocketConnection> SocketListenerTcp::getNewClient(
           !cb_access || cb_access(dst, *slen, empty_handshake) ==
                           SocketListener::accessReturn::ACCESS_NEW)
         {
-          return std::make_unique<SocketConnection>(new_fd, *this, *slen, dst);
+          return std::make_optional<SocketConnection>(new_fd);
         }
       else
         {
@@ -281,7 +292,7 @@ std::unique_ptr<SocketConnection> SocketListenerTcp::getNewClient(
           throw std::system_error(errno, std::system_category(), "Accept");
         }
     }
-  return nullptr;
+  return {};
 }
 
 SocketListenerUdp::SocketListenerUdp(const struct sockaddr_storage *saddr,
@@ -295,7 +306,20 @@ SocketListenerUdp::SocketListenerUdp(const struct sockaddr_storage *saddr,
   LOG_DBG("Listening UDP on: ", this);
 }
 
-std::unique_ptr<SocketConnection> SocketListenerUdp::getNewClient(
+bool Socket::getSource(struct sockaddr_storage &src, socklen_t &slen) const
+{
+  if (!::getsockname(fd(), reinterpret_cast<struct sockaddr *>(&src), &slen))
+      {
+      return true;
+      }
+  else
+    {
+      LOG_ERR("Failed to get ", fd(), " bound source: ", ::strerror(errno));
+    }
+  return false;
+}
+
+std::optional<SocketConnection> SocketListenerUdp::getNewClient(
   struct sockaddr_storage *dst, socklen_t *slen, std::vector<uint8_t> &data,
   accessCb cb_access) const
 {
@@ -314,34 +338,48 @@ std::unique_ptr<SocketConnection> SocketListenerUdp::getNewClient(
       .msg_controllen = 0,
       .msg_flags = 0
     };
+  struct sockaddr_storage sockname;
+  socklen_t sockname_len = sizeof(sockname);
 
-  if (int ret = ::recvmsg(fd(), &hdr, 0); ret >= 0)
+  if (!::getsockname(fd(), reinterpret_cast<struct sockaddr *>(&sockname),
+                   &sockname_len))
     {
-      SocketListener::accessReturn access_ret =
-        SocketListener::accessReturn::ACCESS_NEW;
+      if (int ret = ::recvmsg(fd(), &hdr, 0); ret >= 0)
+        {
+          SocketListener::accessReturn access_ret =
+            SocketListener::accessReturn::ACCESS_NEW;
 
-      data.resize(ret);
-      if (cb_access)
-        {
-          access_ret = cb_access(dst, hdr.msg_namelen, data);
+          data.resize(ret);
+          if (cb_access)
+            {
+              access_ret = cb_access(dst, hdr.msg_namelen, data);
+            }
+          if (access_ret == SocketListener::accessReturn::ACCESS_NEW)
+            {
+              return std::make_optional<SocketConnection>(
+                SOCK_DGRAM, defaultSockopts, sockname, sockname_len, *dst,
+                hdr.msg_namelen);
+            }
+          else
+            {
+              LOG_DBG("Peer ", saddr_to_string(dst, *slen), " ",
+                      (access_ret == SocketListener::accessReturn::ACCESS_DENY)
+                        ? "denied"
+                        : "existed");
+            }
         }
-      if (access_ret == SocketListener::accessReturn::ACCESS_NEW)
+      else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
         {
-          return std::make_unique<SocketConnection>(
-            SOCK_DGRAM, defaultSockopts, this->mSource, this->mSourceLen, *dst,
-            hdr.msg_namelen);
+          LOG_ERR("Failed to read ", this, ": ", ::strerror(errno));
         }
       else
         {
-          LOG_DBG("Peer ", saddr_to_string(dst, *slen), " ",
-                  (access_ret == SocketListener::accessReturn::ACCESS_DENY)
-                    ? "denied"
-                    : "existed");
+          ret = 0;
         }
     }
-  else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+  else
     {
-      LOG_ERR("Failed to read ", this, ": ", strerror(errno));
+      LOG_ERR("Failed to solve ", fd(), " name: ", ::strerror(errno));
     }
-  return nullptr;
+  return {};
 }

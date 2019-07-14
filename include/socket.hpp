@@ -6,6 +6,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <variant>
 
 extern "C"
 {
@@ -22,6 +23,26 @@ extern "C"
 
 namespace Sukat
 {
+class Fd
+{
+ public:
+  Fd(int fd) : mFd(fd){};
+  Fd() = default;
+  ~Fd();
+  Fd(Fd &&other)
+  {
+    mFd = other.mFd;
+    other.mFd = -1;
+  }
+  auto fd() const
+  {
+    return mFd;
+  };
+
+ private:
+  int mFd{-1};
+};
+
 /** @brief Utility: Stringifies a sockaddr */
 std::string saddr_to_string(const struct sockaddr_storage *addr, socklen_t len);
 
@@ -37,45 +58,33 @@ class Socket
          const struct sockaddr_storage *src = &inAnyAddr,
          socklen_t src_len = inAnyAddrLen);
   /** @brief Creates a new fd from an accepted connection. */
-  Socket(int fd, const struct sockaddr_storage *src, socklen_t src_len);
+  Socket(Fd &&fd) : mFd(std::move(fd)) { };
 
   /** @brief Closes a file descriptor */
   ~Socket();
 
   int fd() const
   {
-    return mFd;
+    return mFd.fd();
   }
 
   /** @brief Checks if object can accept new connections */
   virtual bool canAccept() const = 0;
 
   /** @brief Add given socket to epoll fd */
-  void addToEfd(int efd) const;
+  void addToEfd(int efd, uint32_t events = EPOLLIN) const;
 
   /** @brief For std::container */
   bool operator<(const Socket &other) const
   {
-    return mFd < other.mFd;
+    return mFd.fd() < other.mFd.fd();
   }
 
   /** @brief Fetches the source address and address len */
-  const struct sockaddr_storage *getSource(socklen_t *slen)
-  {
-    if (slen)
-      {
-        *slen = mSourceLen;
-      }
-    return &mSource;
-  }
+  bool getSource(struct sockaddr_storage &src, socklen_t &slen) const;
 
   /** @brief Stringifies the socket */
-  friend std::ostream &operator<<(std::ostream &os, Socket const &sock)
-  {
-    os << "fd: " << std::to_string(sock.mFd)
-       << ", bound: " << saddr_to_string(&sock.mSource, sock.mSourceLen);
-    return os;
-  }
+  friend std::ostream &operator<<(std::ostream &os, Socket const &sock);
 
   /** @brief Stringifies a pointer to the socket */
   friend std::ostream &operator<<(std::ostream &os, Socket const *sock)
@@ -84,10 +93,7 @@ class Socket
     return os;
   }
 
-  socklen_t mSourceLen;            //!< Length of source bound to.
-  struct sockaddr_storage mSource; //!< Storage of bound data.
-
-  Socket(Socket&& other) = delete;
+  Socket(Socket &&other) : mFd(std::move(other.mFd)){}
 
  protected:
   static const socklen_t inAnyAddrLen;   //!< Default socket address length.
@@ -96,7 +102,7 @@ class Socket
   static constexpr struct sockaddr_storage inAnyAddr = {.ss_family = AF_INET6};
 
  private:
-  int mFd{-1}; //!< File descriptor
+  Fd mFd; //!< File descriptor
 };
 
 /** Forward decl */
@@ -112,27 +118,29 @@ class SocketConnection : public Socket
   /** @brief Write data to connection */
   virtual int writeData(const uint8_t *data, size_t len) const;
 
+  /** @brief on PollOut checks SOL_ERROR
+   *
+   * Used to determine if a non-blocking socket has connected properly.
+   *
+   * @return == 0       Connected.
+   * @return < 0        Failure, error code. (maybe errno compatible?).
+   */
+  int polloutReady() const;
+
   /** @brief Checker to determine if socket is writable/readable yet. */
-  bool ready() const
-  {
-    return complete;
-  };
+  bool ready(int timeout = 0) const;
 
   virtual bool canAccept() const override
   {
      return false;
   };
 
-  /** @brief Finish the connection (3-way handshake on TCP */
-  bool finish();
-
   /** @brief Create a new connection from an accepted fd. */
-  SocketConnection(int fd, const SocketListener &main, socklen_t dst_len = 0,
-                   const struct sockaddr_storage *dst = nullptr);
+  SocketConnection(Fd fd) : Socket(std::move(fd)) {} ;
 
   /** @brief Create a new connection by connecting to a given end-point */
   SocketConnection(int socktype, const struct sockaddr_storage &dst,
-                   socklen_t slen);
+                   socklen_t dlen);
 
   /** @brief Same but bind to the given source and connect */
   SocketConnection(int socktype, sockopts opts,
@@ -140,8 +148,6 @@ class SocketConnection : public Socket
                    const struct sockaddr_storage &dst, socklen_t dlen);
 
  private:
-  socklen_t mDestinationLen;            //!< Socket destination.
-  struct sockaddr_storage mDestination; //!< Destination length.
   bool complete;                        //!< Connect complete.
 };
 
@@ -163,7 +169,7 @@ class SocketListener : public Socket
    * @param data       Possible handshake data received while accepting client.
    */
   using newClientCb = std::function<void(
-    std::unique_ptr<SocketConnection> &&new_conn, std::vector<uint8_t> &data)>;
+    SocketConnection &&new_conn, std::vector<uint8_t> &data)>;
 
   using accessCb = std::function<accessReturn(
     const struct sockaddr_storage *peer,
@@ -183,6 +189,8 @@ class SocketListener : public Socket
   };
 
  protected:
+
+  using newClientType = std::optional<SocketConnection>;
   /**
    * @brief Fetch a new connection from derived class
    *
@@ -190,9 +198,11 @@ class SocketListener : public Socket
    * @param slen        Length of previous storage.
    * @param data        Vector containing possible handshake data received.
    *
-   * @return >= 0       New file descriptor.
+   * @return std::any_cast<SocketConnection> New connection.
+   * @return std::any_cast<int> 0       Socket exhausted.
+   * @return std::any_cast<int> -1      Socket error.
    */
-  virtual std::unique_ptr<SocketConnection> getNewClient(
+  virtual newClientType getNewClient(
     struct sockaddr_storage *dst, socklen_t *slen, std::vector<uint8_t> &data,
     accessCb cb_access) const = 0;
 
@@ -212,7 +222,7 @@ class SocketListenerTcp : public SocketListener
 
  protected:
   /** @brief accept a new connection */
-  virtual std::unique_ptr<SocketConnection> getNewClient(
+  virtual std::optional<SocketConnection> getNewClient(
     struct sockaddr_storage *dst, socklen_t *slen, std::vector<uint8_t> &data,
     accessCb cb_access) const override;
 };
@@ -226,7 +236,7 @@ public:
 
  protected:
   /** @brief Accept a new UDP connection */
-  virtual std::unique_ptr<SocketConnection> getNewClient(
+  virtual std::optional<SocketConnection> getNewClient(
     struct sockaddr_storage *dst, socklen_t *slen, std::vector<uint8_t> &data,
     accessCb cb_access) const override;
 };
