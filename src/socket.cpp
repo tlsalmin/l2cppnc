@@ -3,6 +3,7 @@
 extern "C"
 {
 #include <netdb.h>
+#include <sys/un.h>
 }
 
 using namespace Sukat;
@@ -10,63 +11,83 @@ using namespace Sukat;
 std::string Sukat::saddr_to_string(const struct sockaddr_storage *addr,
                                    socklen_t len)
 {
-  char host[INET6_ADDRSTRLEN], service[32];
-  std::integral_constant<int, NI_NUMERICHOST | NI_NUMERICSERV> flags;
-  socklen_t hostlen = sizeof(host), servlen = sizeof(service);
   std::stringstream desc;
-
-  if (!::getnameinfo(reinterpret_cast<const struct sockaddr *>(addr), len, host,
-                     hostlen, service, servlen, flags))
+  if (addr->ss_family == AF_UNIX)
     {
-      desc << "(" << host << " [" << service << "])";
+      const struct sockaddr_un *sun =
+        reinterpret_cast<const struct sockaddr_un *>(addr);
+
+      if (len > sizeof(sun->sun_family))
+        {
+          bool is_abstract = (sun->sun_path[0] == '\0');
+          socklen_t string_len = len - (sizeof(sun->sun_family) + is_abstract);
+
+          if (string_len > 0)
+            {
+              std::string socket_path(sun->sun_path[is_abstract], string_len);
+
+              desc << "(" << (is_abstract ? "@" : "") << socket_path << ")";
+            }
+          {
+            desc << "Not enough data for unix path";
+          }
+        }
+      else
+        {
+          desc << "Not enough data in sockaddr";
+        }
     }
   else
     {
-      throw std::system_error(errno, std::system_category(), "getnameinfo");
+      char host[INET6_ADDRSTRLEN], service[32];
+      std::integral_constant<int, NI_NUMERICHOST | NI_NUMERICSERV> flags;
+      socklen_t hostlen = sizeof(host), servlen = sizeof(service);
+
+      if (!::getnameinfo(reinterpret_cast<const struct sockaddr *>(addr), len,
+                         host, hostlen, service, servlen, flags))
+        {
+          desc << "(" << host << " [" << service << "])";
+        }
+      else
+        {
+          desc << "getnameinfo failed with " << strerror(errno);
+        }
     }
   return desc.str();
 }
 
-const Socket::sockopts Socket::defaultSockopts =
-  std::set{std::make_pair<int, int>(SO_REUSEADDR, 1)};
+const Socket::sockopts Socket::defaultSockopts = { };
 
-Socket::Socket(int socktype, Socket::sockopts sockopts, bindopt src)
-  : mFd(::socket(std::holds_alternative<int>(src)
+Socket::Socket(__socket_type socktype, Socket::sockopts sockopts, bindopt src)
+  : mFd(::socket(src.index()
                    ? std::get<int>(src)
                    : std::get<endpoint>(src).first.ss_family,
                  socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, 0))
 {
   std::system_error e;
-  struct sockaddr_storage saddr = { };
-  socklen_t slen = sizeof(saddr);
+  bool do_bind = !src.index(); // Only bind if specific end-point given.
 
-  if (!src.index())
-    {
-      slen = std::get<endpoint>(src).second;
-      assert(slen <= sizeof(saddr));
-      memcpy(&saddr, &std::get<endpoint>(src).first, slen);
-    }
-  else if (src.index() == 1)
-    {
-      saddr.ss_family = std::get<int>(src);
-    }
-
-  LOG_DBG("Creating socket family: ", saddr.ss_family, ", type: ",
-              socktype, ", socklen: ", slen);
+  LOG_DBG("Creating socket type: ", socktype);
 
   if (mFd.fd() != -1)
     {
-      for (const auto &opt : sockopts)
+      if (sockopts.has_value())
         {
-          if (::setsockopt(mFd.fd(), SOL_SOCKET, opt.first, &opt.second,
-                           sizeof(opt.second)))
+          for (const auto &opt : sockopts.value())
             {
-              e = std::system_error(errno, std::system_category(), "sockopts");
+              if (::setsockopt(mFd.fd(), SOL_SOCKET, opt.first, &opt.second,
+                               sizeof(opt.second)))
+                {
+                  e = std::system_error(errno, std::system_category(),
+                                        "sockopts");
+                }
             }
         }
 
-      if (!bind(mFd.fd(), reinterpret_cast<const struct sockaddr *>(&saddr),
-                slen))
+      if (!do_bind || !::bind(mFd.fd(),
+                              reinterpret_cast<const struct sockaddr *>(
+                                &std::get<endpoint>(src).first),
+                              std::get<endpoint>(src).second))
         {
           return;
         }
@@ -84,7 +105,10 @@ Socket::Socket(int socktype, Socket::sockopts sockopts, bindopt src)
 
 Socket::~Socket()
 {
-  LOG_DBG("Closing socket ", this);
+  if (fd() != -1)
+    {
+      LOG_DBG("Closing socket ", this);
+    }
 }
 
 void Socket::addToEfd(int efd, uint32_t events) const
@@ -119,13 +143,62 @@ std::stringstream SocketConnection::readData() const
   return data;
 };
 
-int SocketConnection::writeData(const uint8_t *data, size_t len) const
+int SocketConnection::write(const struct msghdr &hdr, int flags) const
 {
-  LOG_DBG("Sending ", len, " bytes to ", this);
-  return ::send(fd(), data, len, 0);
+  return ::sendmsg(fd(), &hdr, flags);
 }
 
-SocketConnection::SocketConnection(int socktype, sockopts opts,
+int SocketConnection::write(void *data, size_t len, int flags) const
+{
+  struct iovec iov =
+    {
+      .iov_base = data,
+      .iov_len = len
+    };
+  struct msghdr hdr =
+    {
+      .msg_iov = &iov,
+      .msg_iovlen = 1,
+    };
+
+  LOG_DBG("Sending ", len, " bytes to ", this);
+  return write(hdr, flags);
+}
+
+int SocketConnection::write(const char *data, size_t len, int flags) const
+{
+  void *data_ptr = const_cast<void *>(reinterpret_cast<const void*>(data));
+
+  return write(data_ptr, len, flags);
+}
+
+int SocketConnection::write(const char *data, int flags) const
+{
+  return write(data, strlen(data), flags);
+}
+
+int SocketConnection::write(const std::string &data, int flags) const
+{
+  return write(data.c_str(), data.length(), flags);
+}
+
+int SocketConnection::write(struct iovec &iov, size_t n_iov, int flags) const
+{
+  struct msghdr hdr =
+    {
+      .msg_iov = &iov,
+      .msg_iovlen = n_iov
+    };
+
+  return write(hdr, flags);
+}
+
+int SocketConnection::operator<<(const std::ostringstream &data)
+{
+  return write(data.str(), 1);
+}
+
+SocketConnection::SocketConnection(__socket_type socktype, sockopts opts,
                                    Socket::bindopt src,
                                    Socket::endpoint dst)
   : Socket(socktype, opts, src), complete(false)
@@ -196,8 +269,7 @@ bool SocketConnection::ready(int timeout) const
   return bret;
 }
 
-unsigned int SocketListener::acceptNew(newClientCb cb,
-                                       accessCb cb_access) const
+unsigned int SocketListener::accept(newClientCb cb, accessCb cb_access) const
 {
   unsigned int count = 0;
   Socket::endpoint endpoint({}, sizeof(endpoint.first));
@@ -213,13 +285,27 @@ unsigned int SocketListener::acceptNew(newClientCb cb,
   return count;
 }
 
-SocketListenerTcp::SocketListenerTcp(Socket::bindopt opt,
-                    Socket::sockopts opts)
-  : SocketListener::SocketListener(SOCK_STREAM, opts, opt)
+std::vector<SocketConnection> SocketListener::accept(accessCb cb_access) const
+{
+  Socket::endpoint endpoint({}, sizeof(endpoint.first));
+  std::vector<uint8_t> data(BUFSIZ);
+  std::vector<SocketConnection> newClients;
+
+  while (newClientType ret{getNewClient(endpoint, data, cb_access)})
+    {
+      LOG_DBG("New client: ", &ret.value());
+      newClients.emplace_back(std::move(ret.value()));
+    }
+  return newClients;
+}
+
+SocketListenerStream::SocketListenerStream(Socket::bindopt opt,
+                    Socket::sockopts opts, __socket_type socktype)
+  : SocketListener::SocketListener(socktype, opts, opt)
 {
   if (!listen(fd(), 16))
     {
-      LOG_DBG("Listening TCP on: ", this);
+      LOG_DBG("Listening on: ", this);
       // Success.
     }
   else
@@ -228,7 +314,7 @@ SocketListenerTcp::SocketListenerTcp(Socket::bindopt opt,
     }
 }
 
-std::optional<SocketConnection> SocketListenerTcp::getNewClient(
+std::optional<SocketConnection> SocketListenerStream::getNewClient(
   Socket::endpoint &sender, __attribute__((unused)) std::vector<uint8_t> &data,
   accessCb cb_access) const
 {
@@ -323,7 +409,8 @@ std::optional<SocketConnection> SocketListenerUdp::getNewClient(
           if (access_ret == SocketListener::accessReturn::ACCESS_NEW)
             {
               return std::make_optional<SocketConnection>(
-                SOCK_DGRAM, defaultSockopts, src, sender);
+                SOCK_DGRAM, std::set{std::make_pair<int, int>(SO_REUSEADDR, 1)},
+                src, sender);
             }
           else
             {

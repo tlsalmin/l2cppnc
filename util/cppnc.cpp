@@ -137,10 +137,7 @@ class NetCat
                           dynamic_cast<SocketConnection *>(conn.second.get());
                         if (connection->ready())
                           {
-                            connection->writeData(
-                              reinterpret_cast<const uint8_t *>(
-                                data.str().c_str()),
-                              data.str().length());
+                            connection->write(data.str().c_str());
                           }
                       }
                     return {};

@@ -25,7 +25,7 @@ class SukatSocketTest : public ::testing::Test
 TEST_F(SukatSocketTest, SukatSocketTestInit)
 {
   std::string data;
-  Sukat::SocketListenerTcp tcp_listener;
+  Sukat::SocketListenerStream tcp_listener;
   int ret;
   bool bret;
   std::unique_ptr<Sukat::SocketConnection> conn_from_server(nullptr);
@@ -35,7 +35,7 @@ TEST_F(SukatSocketTest, SukatSocketTestInit)
 
   Sukat::SocketConnection client(SOCK_STREAM, saddr.value());
 
-  ret = tcp_listener.acceptNew(
+  ret = tcp_listener.accept(
     [&](Sukat::SocketConnection &&conn,
         __attribute__((unused)) std::vector<uint8_t> data) {
       conn_from_server = std::make_unique<Sukat::SocketConnection>(std::move(conn));
@@ -48,16 +48,14 @@ TEST_F(SukatSocketTest, SukatSocketTestInit)
   EXPECT_EQ(true, bret);
 
   data = "hello from server";
-  ret = conn_from_server->writeData(
-    reinterpret_cast<const uint8_t *>(data.c_str()), data.length());
+  ret = conn_from_server->write(data);
   EXPECT_EQ(ret, data.length());
 
   auto readData = client.readData();
   EXPECT_EQ(data, readData.str());
 
   data = "Hello from client";
-  ret = client.writeData(reinterpret_cast<const uint8_t *>(data.c_str()),
-                         data.length());
+  ret = client.write(data);
   EXPECT_EQ(ret, data.length());
 
   readData = conn_from_server->readData();
@@ -76,11 +74,10 @@ TEST_F(SukatSocketTest, SukatSocketTestUdp)
 
   Sukat::SocketConnection client(SOCK_DGRAM, saddr.value());
 
-  ret = client.writeData(reinterpret_cast<const uint8_t *>(hello.c_str()),
-                         hello.length());
+  ret = client.write(hello);
   EXPECT_EQ(ret, hello.length());
 
-  ret = udp_listener.acceptNew(
+  ret = udp_listener.accept(
     [&](Sukat::SocketConnection &&conn,
         __attribute__((unused)) std::vector<uint8_t> data) {
       conn_from_server =
@@ -111,15 +108,75 @@ TEST_F(SukatSocketTest, SukatSocketTestUdp)
       return Sukat::SocketListener::accessReturn::ACCESS_NEW;
     });
 
-  EXPECT_NE(nullptr, conn_from_server);
+  ASSERT_NE(nullptr, conn_from_server);
 
   hello = "Hello from server";
-  ret = conn_from_server->writeData(
-    reinterpret_cast<const uint8_t *>(hello.c_str()), hello.length());
+  ret = conn_from_server->write(hello);
   EXPECT_EQ(ret, hello.length());
 
   auto reply = client.readData();
   EXPECT_EQ(hello, reply.str());
+}
+
+TEST_F(SukatSocketTest, SukatSocketTestTcp)
+{
+  Sukat::AddrInfo addrinfo("localhost", {}, AF_INET, SOCK_STREAM);
+  Sukat::SocketListenerStream tcp_listener(
+    Sukat::Socket::make_endpoint(addrinfo.mResults[0]));
+  auto server_addr = tcp_listener.getSource();
+  unsigned int n_connections = 8, i;
+  std::vector<Sukat::SocketConnection> connections, clients;
+  int ret;
+
+  for (i = 0; i < n_connections; i++)
+    {
+      connections.emplace_back(SOCK_STREAM, server_addr.value());
+    }
+  ret = tcp_listener.accept(
+    [&](Sukat::SocketConnection &&conn,
+        __attribute__((unused)) std::vector<uint8_t> data) {
+      clients.emplace_back(std::move(conn));
+    });
+  EXPECT_EQ(clients.size(), n_connections);
+
+  for (auto &conn : connections)
+    {
+      std::ostringstream data;
+      if (!conn.ready())
+        {
+          auto bret = conn.connComplete();
+          EXPECT_TRUE(bret);
+        }
+      data << "Hello from ";
+      data << i;
+      ret = conn << data;
+      EXPECT_EQ(ret, data.str().length());
+    }
+}
+
+TEST_F(SukatSocketTest, SukatSocketTestUnix)
+{
+  std::filesystem::path path("./test_unix.socket");
+  Sukat::SocketListenerStream unix_listener(
+    Sukat::Socket::make_endpoint(path, true));
+  Sukat::SocketConnection conn(path, true);
+  std::string data_to_write = "Hello from client",
+              data_reply = "Hello from server";
+
+  conn.write(data_to_write);
+  auto clients = unix_listener.accept();
+  EXPECT_EQ(1, clients.size());
+
+  for (auto &client : clients)
+    {
+      auto data = client.readData();
+      EXPECT_EQ(data.str(), data_to_write);
+
+      client.write(data_reply);
+    }
+
+  auto data = conn.readData();
+  EXPECT_EQ(data_reply, data.str());
 }
 
 int main(int argc, char **argv)
